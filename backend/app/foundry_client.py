@@ -294,7 +294,7 @@ class LiveProvider:
             text = (_attr(response, "output_text", "") or "").strip()
         text = _strip_text_prefix(text)
 
-        return text, sources, steps
+        return text, _dedupe_sources(sources), steps
 
     def _parse_message_item(self, item) -> tuple[str, list[Source]]:
         text_parts: list[str] = []
@@ -422,6 +422,19 @@ class LiveProvider:
                 "matches an agent in this Foundry project. Original error: " + msg
             )
         return f"Foundry agent call failed: {msg}"
+
+
+def _dedupe_sources(sources: list[Source]) -> list[Source]:
+    """Drop duplicate citations (same doc + url + snippet), preserving order."""
+    seen: set[tuple] = set()
+    out: list[Source] = []
+    for s in sources:
+        key = (s.title, s.url, s.file_name, s.snippet)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
 
 
 def _chunks(text: str, size: int):
