@@ -60,18 +60,53 @@ specialists work.
 
 ## Switching from mock to live Foundry
 
-Edit `backend/.env`:
+Edit `backend/.env` (copy it from `.env.example` first):
 
 ```ini
+# 1. Turn off mock mode
 USE_MOCK=false
+
+# 2. Point at your project
 PROJECT_ENDPOINT=https://<your-resource>.services.ai.azure.com/api/projects/<project>
-MAIN_AGENT_ID=asst_xxxxxxxx           # your orchestrator agent
-CONNECTED_AGENT_IDS=asst_aaa,asst_bbb # optional: label connected sub-agents
-MODEL_DEPLOYMENT=gpt-4o               # display only
+
+# 3. Identify the orchestrator agent BY NAME (matched case-insensitively)...
+MAIN_AGENT_NAME=RFP Agent
+#    ...or by id if you prefer:
+# MAIN_AGENT_ID=asst_xxxxxxxxxxxx
+
+# 4. (Optional) label connected sub-agents by name or id
+# CONNECTED_AGENT_NAMES=Requirements Analyst,Compliance Reviewer,Pricing Estimator
+# CONNECTED_AGENT_IDS=asst_aaa,asst_bbb
+
+MODEL_DEPLOYMENT=gpt-4o   # display only
 ```
 
-Then `az login` and restart the backend. The header badge flips from **Mock mode** to
-**Live Foundry** when `PROJECT_ENDPOINT` + `MAIN_AGENT_ID` are set and `USE_MOCK=false`.
+### Authentication (DefaultAzureCredential)
+
+The backend authenticates with `DefaultAzureCredential` — no keys in the app. It tries, in
+order: environment variables → Managed Identity → **Azure CLI** → Azure PowerShell → VS Code.
+For local dev the simplest path is the Azure CLI:
+
+```powershell
+az login
+az account set --subscription "<your-subscription>"   # if you have more than one
+```
+
+Make sure that signed-in identity has an **Azure AI Developer** (or equivalent) role on the
+Foundry project. Then restart the backend:
+
+```powershell
+uvicorn app.main:app --reload --port 8000
+```
+
+The header badge flips from **Mock mode** to **Live Foundry** once `USE_MOCK=false` and
+`PROJECT_ENDPOINT` + (`MAIN_AGENT_NAME` or `MAIN_AGENT_ID`) are set. Confirm with
+`curl http://127.0.0.1:8000/api/health` → `"live_ready": true`.
+
+> Agent name vs id: the SDK runs agents by id, so when you supply `MAIN_AGENT_NAME` the
+> backend lists the project's agents once and resolves the name to its id. Names are matched
+> case-insensitively; if no match is found you'll get a clear error naming the agent it
+> looked for.
 
 ### How sub‑agent output and sources are surfaced (live mode)
 

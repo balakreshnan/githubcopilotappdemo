@@ -49,6 +49,8 @@ class LiveProvider:
         self.settings = settings
         self._client = None
         self._agent_names: dict[str, str] = {}
+        self._all_agents_cache: Optional[list] = None
+        self._resolved_main_id: Optional[str] = None
 
     # ---- client lifecycle -------------------------------------------------
     def _get_client(self):
@@ -68,25 +70,84 @@ class LiveProvider:
         # azure-ai-projects exposes the agents ops as `.agents`
         return getattr(client, "agents", client)
 
+    # ---- agent lookup by name --------------------------------------------
+    def _all_agents(self, agents) -> list:
+        """List every agent in the project (cached) for name-based resolution."""
+        if self._all_agents_cache is None:
+            try:
+                if hasattr(agents, "list_agents"):
+                    self._all_agents_cache = list(agents.list_agents())
+                else:
+                    self._all_agents_cache = list(agents.list())
+            except Exception:
+                self._all_agents_cache = []
+        return self._all_agents_cache
+
+    def _find_by_name(self, agents, name: str):
+        target = name.strip().lower()
+        for a in self._all_agents(agents):
+            if (_attr(a, "name", "") or "").strip().lower() == target:
+                return a
+        return None
+
+    def _resolve_agent(self, agents, by_id: str, by_name: str):
+        """Resolve an agent to (id, name, description) from an id or a name."""
+        if by_id:
+            try:
+                agent = agents.get_agent(by_id)
+                return by_id, _attr(agent, "name", by_id) or by_id, _attr(agent, "description", "") or ""
+            except Exception:
+                return by_id, by_id, ""
+        if by_name:
+            agent = self._find_by_name(agents, by_name)
+            if agent is not None:
+                return (
+                    _attr(agent, "id"),
+                    _attr(agent, "name", by_name) or by_name,
+                    _attr(agent, "description", "") or "",
+                )
+        return None
+
+    def _main_agent_id(self, agents) -> str:
+        """The orchestrator agent id, resolved from MAIN_AGENT_ID or MAIN_AGENT_NAME."""
+        if self._resolved_main_id:
+            return self._resolved_main_id
+        resolved = self._resolve_agent(
+            agents, self.settings.main_agent_id, self.settings.main_agent_name
+        )
+        if not resolved or not resolved[0]:
+            raise RuntimeError(
+                "Could not resolve the main agent. Set MAIN_AGENT_ID, or set "
+                f"MAIN_AGENT_NAME to an agent that exists in this project "
+                f"(looked for '{self.settings.main_agent_name}')."
+            )
+        self._resolved_main_id = resolved[0]
+        return self._resolved_main_id
+
     # ---- agent metadata ---------------------------------------------------
     def list_agents(self) -> list[AgentInfo]:
         agents = self._agents()
         infos: list[AgentInfo] = []
-        ids = [self.settings.main_agent_id, *self.settings.connected_agent_id_list]
-        roles = ["main"] + ["connected"] * len(self.settings.connected_agent_id_list)
-        for agent_id, role in zip(ids, roles):
-            if not agent_id:
+
+        main = self._resolve_agent(
+            agents, self.settings.main_agent_id, self.settings.main_agent_name
+        )
+        if main:
+            self._agent_names[main[0]] = main[1]
+            infos.append(AgentInfo(id=main[0], name=main[1], description=main[2], role="main"))
+
+        connected_ids = self.settings.connected_agent_id_list
+        connected_names = self.settings.connected_agent_name_list
+        pairs = [(cid, "") for cid in connected_ids] + [("", cn) for cn in connected_names]
+        for cid, cname in pairs:
+            resolved = self._resolve_agent(agents, cid, cname)
+            if not resolved or not resolved[0]:
                 continue
-            name, desc = agent_id, ""
-            try:
-                agent = agents.get_agent(agent_id)
-                name = _attr(agent, "name", agent_id) or agent_id
-                desc = _attr(agent, "description", "") or ""
-            except Exception:
-                pass
-            self._agent_names[agent_id] = name
+            self._agent_names[resolved[0]] = resolved[1]
             infos.append(
-                AgentInfo(id=agent_id, name=name, description=desc, role=role)  # type: ignore[arg-type]
+                AgentInfo(
+                    id=resolved[0], name=resolved[1], description=resolved[2], role="connected"
+                )
             )
         return infos
 
@@ -200,7 +261,7 @@ class LiveProvider:
             agents.create_message(thread_id=thread_id, role="user", content=message)
 
     def _create_run(self, agents, thread_id: str):
-        agent_id = self.settings.main_agent_id
+        agent_id = self._main_agent_id(agents)
         if hasattr(agents, "runs"):
             return agents.runs.create(thread_id=thread_id, agent_id=agent_id)
         return agents.create_run(thread_id=thread_id, agent_id=agent_id)

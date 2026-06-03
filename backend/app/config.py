@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     # Foundry / Azure AI connection
     project_endpoint: str = ""
     main_agent_id: str = ""
+    main_agent_name: str = ""
     connected_agent_ids: str = ""
+    connected_agent_names: str = ""
     model_deployment: str = ""
 
     # Behavior
@@ -26,13 +28,17 @@ class Settings(BaseSettings):
         return [a.strip() for a in self.connected_agent_ids.split(",") if a.strip()]
 
     @property
+    def connected_agent_name_list(self) -> list[str]:
+        return [a.strip() for a in self.connected_agent_names.split(",") if a.strip()]
+
+    @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
     def live_ready(self) -> bool:
         """True when enough config exists to talk to a real Foundry project."""
-        return bool(self.project_endpoint and self.main_agent_id)
+        return bool(self.project_endpoint and (self.main_agent_id or self.main_agent_name))
 
 
 @lru_cache
