@@ -52,7 +52,9 @@ export async function streamChat(
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    // Normalize CRLF -> LF so frame/line parsing works regardless of the
+    // server's line endings (sse-starlette emits \r\n\r\n between frames).
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
 
     // SSE frames are separated by a blank line.
     let sep: number;
@@ -62,12 +64,18 @@ export async function streamChat(
       dispatchFrame(frame, handlers);
     }
   }
+
+  // Flush any trailing frame that wasn't terminated by a blank line before the
+  // stream closed, so the final (often "done") event is never dropped.
+  const tail = buffer.replace(/\r\n/g, "\n").trim();
+  if (tail) dispatchFrame(tail, handlers);
 }
 
 function dispatchFrame(frame: string, handlers: StreamHandlers): void {
   let event = "message";
   const dataLines: string[] = [];
-  for (const line of frame.split("\n")) {
+  for (const rawLine of frame.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
     if (line.startsWith("event:")) event = line.slice(6).trim();
     else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
   }

@@ -33,13 +33,21 @@ _NON_STEP_ITEM_TYPES = {"message", "reasoning", "mcp_list_tools"}
 
 
 def _strip_text_prefix(s: str) -> str:
-    """Strip a stray leading ``text`` artifact this Foundry preview prepends to answers.
+    """Strip stray ``text`` artifacts this Foundry preview prepends to answers.
 
-    Observed consistently as the literal ``text`` immediately followed by the real
-    answer, e.g. ``textAn RFI...`` or ``text\\n\\nBased on...``. Stripped only when what
-    follows is an uppercase letter, newline, or markdown marker, to avoid mangling
-    answers that legitimately begin with the lowercase word "text".
+    Two shapes have been observed:
+      * a bare ``text`` immediately followed by the real answer, e.g. ``textAn RFI...``
+        or ``text\\n\\nBased on...``
+      * the whole answer wrapped as ``text[ <answer> ]``
+    The bare prefix is stripped only when what follows is an uppercase letter,
+    newline, or markdown marker, to avoid mangling answers that legitimately begin
+    with the lowercase word "text".
     """
+    s = s.strip()
+    if s.startswith("text[") and s.endswith("]"):
+        inner = s[len("text["):-1].strip()
+        if inner:
+            return inner
     if s.startswith("text") and len(s) > 4:
         nxt = s[4]
         if nxt.isupper() or nxt in "\n\r\t#*->•":
