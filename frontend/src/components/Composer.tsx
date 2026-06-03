@@ -1,9 +1,12 @@
 import { useState } from "react";
 
 const SUGGESTIONS = [
-  "Draft a response to the cloud infrastructure RFP",
-  "Summarize the compliance requirements and our coverage",
-  "Build a pricing estimate for a 12-month engagement",
+  "Summarize the Virginia Railway Express project RFP with details",
+  "Summarize the scope of work for the Connecticut Department of Transportation project RFP",
+  "Summarize the RFP for fiber network construction for Holy Cross Energy",
+  "Summarize the Request for Qualification for the Moscone Expansion Project construction management support services",
+  "Summarize the RFP for US Department of Transportation project management oversight",
+  "Summarize the RFP for construction engineering inspection services for Bristol District",
 ];
 
 export function Composer({

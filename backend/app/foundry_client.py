@@ -44,10 +44,14 @@ def _strip_text_prefix(s: str) -> str:
     with the lowercase word "text".
     """
     s = s.strip()
-    if s.startswith("text[") and s.endswith("]"):
-        inner = s[len("text["):-1].strip()
-        if inner:
-            return inner
+    if s.startswith("text["):
+        # Whole-answer wrapper: ``text[ <answer> ]`` — sometimes unbalanced (no
+        # trailing ``]``). A real answer never starts with the literal "text[",
+        # so stripping the prefix is safe; drop a matching trailing ``]`` too.
+        s = s[len("text["):].lstrip()
+        if s.endswith("]"):
+            s = s[:-1].rstrip()
+        return s.strip()
     if s.startswith("text") and len(s) > 4:
         nxt = s[4]
         if nxt.isupper() or nxt in "\n\r\t#*->•":
