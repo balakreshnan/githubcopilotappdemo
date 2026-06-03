@@ -11,13 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 from .config import get_settings
 from .mock_data import MockProvider
 from .foundry_client import LiveProvider
-from .models import (
-    AgentInfo,
-    ChatMessage,
-    ChatRequest,
-    CreateThreadResponse,
-    HealthResponse,
-)
+from .models import AgentInfo, ChatRequest, HealthResponse
 
 router = APIRouter(prefix="/api")
 
@@ -47,22 +41,6 @@ def list_agents() -> list[AgentInfo]:
         return get_provider().list_agents()
     except Exception as exc:  # pragma: no cover - surfaced to client
         raise HTTPException(status_code=502, detail=f"Failed to list agents: {exc}")
-
-
-@router.post("/threads", response_model=CreateThreadResponse)
-def create_thread() -> CreateThreadResponse:
-    try:
-        return CreateThreadResponse(thread_id=get_provider().create_thread())
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to create thread: {exc}")
-
-
-@router.get("/threads/{thread_id}/messages", response_model=list[ChatMessage])
-def get_messages(thread_id: str) -> list[ChatMessage]:
-    try:
-        return get_provider().get_messages(thread_id)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to load messages: {exc}")
 
 
 @router.post("/chat")

@@ -38,10 +38,6 @@ class ChatMessage(BaseModel):
     sources: list[Source] = []
 
 
-class CreateThreadResponse(BaseModel):
-    thread_id: str
-
-
 class ChatRequest(BaseModel):
     thread_id: Optional[str] = None
     message: str

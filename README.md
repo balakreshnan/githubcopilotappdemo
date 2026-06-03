@@ -14,9 +14,8 @@ Azure credentials, then flip a flag to point at your real Foundry project.
 ```
 React + Vite UI  ──HTTP/SSE──►  FastAPI backend  ──Azure AI Agents SDK──►  Foundry project
   • Chat (markdown)              • /api/agents                              (existing agents,
-  • Agent Activity panel         • /api/threads                              reused by ID)
-  • Sources panel                • /api/chat (SSE stream)
-                                 • mock mode (USE_MOCK)
+  • Agent Activity panel         • /api/chat (SSE stream)                    reused by ID)
+  • Sources panel                • mock mode (USE_MOCK)
 ```
 
 ## Project layout
@@ -141,9 +140,7 @@ setup, that file is the one place to adjust the mapping.
 | --- | --- | --- |
 | GET | `/api/health` | Status + mock/live flags |
 | GET | `/api/agents` | List the agent team (main + connected) |
-| POST | `/api/threads` | Create a conversation thread |
 | POST | `/api/chat` | Send a message; **SSE stream** of `agent_step` / `token` / `sources` / `done` |
-| GET | `/api/threads/{id}/messages` | Load history |
 
 ## Notes
 

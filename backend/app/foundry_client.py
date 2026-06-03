@@ -217,11 +217,6 @@ class LiveProvider:
         self._threads[thread_id] = None
         return thread_id
 
-    def get_messages(self, thread_id: str) -> list[ChatMessage]:
-        # The Responses API keeps server-side state keyed by response id; the UI keeps
-        # its own visible history, so there's nothing extra to reload here.
-        return []
-
     # ---- chat / streaming -------------------------------------------------
     async def stream_chat(
         self, thread_id: str, message: str

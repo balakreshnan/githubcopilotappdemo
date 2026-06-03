@@ -171,9 +171,6 @@ class MockProvider:
         self._threads[thread_id] = []
         return thread_id
 
-    def get_messages(self, thread_id: str) -> list[ChatMessage]:
-        return self._threads.get(thread_id, [])
-
     async def stream_chat(
         self, thread_id: str, message: str
     ) -> AsyncGenerator[dict, None]:
