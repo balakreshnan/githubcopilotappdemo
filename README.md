@@ -78,6 +78,9 @@ MAIN_AGENT_NAME=RFP Agent
 # CONNECTED_AGENT_NAMES=Requirements Analyst,Compliance Reviewer,Pricing Estimator
 # CONNECTED_AGENT_IDS=asst_aaa,asst_bbb
 
+# 5. (Cross-tenant only) authenticate against the resource's Entra tenant
+# AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000
+
 MODEL_DEPLOYMENT=gpt-4o   # display only
 ```
 
@@ -92,21 +95,33 @@ az login
 az account set --subscription "<your-subscription>"   # if you have more than one
 ```
 
-Make sure that signed-in identity has an **Azure AI Developer** (or equivalent) role on the
-Foundry project. Then restart the backend:
+Make sure that signed-in identity has an **Azure AI Developer** / **Azure AI User** (or
+equivalent) role on the Foundry project — specifically a role that grants the
+`Microsoft.MachineLearningServices/workspaces/agents/action` data action, which is required
+to *run* (not just list) agents. Then restart the backend:
 
 ```powershell
 uvicorn app.main:app --reload --port 8000
 ```
 
+> **Cross-tenant / guest users:** if the Foundry resource lives in a *different* Entra tenant
+> than your default `az login` (common when you're a guest user in the resource's tenant), set
+> `AZURE_TENANT_ID` in `backend/.env` to that resource tenant's id. The backend exports it so
+> `DefaultAzureCredential` requests a token for the right tenant. Symptom of getting this wrong:
+> listing agents works but running one fails with `403 ... does not have permissions for
+> Microsoft.MachineLearningServices/workspaces/agents/action`.
+
 The header badge flips from **Mock mode** to **Live Foundry** once `USE_MOCK=false` and
 `PROJECT_ENDPOINT` + (`MAIN_AGENT_NAME` or `MAIN_AGENT_ID`) are set. Confirm with
 `curl http://127.0.0.1:8000/api/health` → `"live_ready": true`.
 
-> Agent name vs id: the SDK runs agents by id, so when you supply `MAIN_AGENT_NAME` the
-> backend lists the project's agents once and resolves the name to its id. Names are matched
-> case-insensitively; if no match is found you'll get a clear error naming the agent it
-> looked for.
+> How agents are invoked: this app targets the current Foundry agent model in
+> `azure-ai-projects` (2.x), where agents are versioned (ids look like `name:version`) and are
+> run through the **OpenAI Responses API**. The backend calls
+> `AIProjectClient.get_openai_client(agent_name=...)` (with `allow_preview=True`) and
+> `responses.create(...)`, then parses the response's output items to surface each connected
+> sub-agent / tool call and its citations. Supply `MAIN_AGENT_NAME` (a trailing `:version` on
+> an id is stripped automatically).
 
 ### How sub‑agent output and sources are surfaced (live mode)
 

@@ -73,12 +73,12 @@ async def chat(req: ChatRequest):
     provider = get_provider()
 
     async def event_generator():
-        thread_id = req.thread_id
-        if not thread_id:
-            thread_id = await asyncio.to_thread(provider.create_thread)
-        # Tell the client which thread is in use (covers auto-created threads).
-        yield {"event": "thread", "data": json.dumps({"thread_id": thread_id})}
         try:
+            thread_id = req.thread_id
+            if not thread_id:
+                thread_id = await asyncio.to_thread(provider.create_thread)
+            # Tell the client which thread is in use (covers auto-created threads).
+            yield {"event": "thread", "data": json.dumps({"thread_id": thread_id})}
             async for evt in provider.stream_chat(thread_id, req.message):
                 yield {"event": evt["event"], "data": json.dumps(evt["data"])}
         except Exception as exc:  # pragma: no cover

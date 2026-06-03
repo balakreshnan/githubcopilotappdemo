@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     connected_agent_ids: str = ""
     connected_agent_names: str = ""
     model_deployment: str = ""
+    # Tenant to authenticate against. Required when the Foundry resource lives in a
+    # different Entra tenant than your default `az login` (e.g. you're a guest user).
+    azure_tenant_id: str = ""
 
     # Behavior
     use_mock: bool = True

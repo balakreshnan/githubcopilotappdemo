@@ -1,26 +1,82 @@
 """Live provider: reuses existing Microsoft Foundry (Azure AI Foundry) agents.
 
-Uses the Azure AI Agents SDK with DefaultAzureCredential. Agents are **reused by ID** —
-this module never creates or deletes agents.
+This targets the current Foundry agent model exposed by ``azure-ai-projects`` (2.x),
+where agents are versioned (ids look like ``name:version``) and are **invoked through
+the OpenAI Responses API**, not the older thread/run model. We obtain an OpenAI client
+bound to an existing agent via ``AIProjectClient.get_openai_client(agent_name=...)`` and
+call ``responses.create(...)``.
+
+Agents are **reused by name/id** — this module never creates or deletes agents.
 
 The SDK is imported lazily so the app can run in mock mode without the azure packages
-installed. The live path uses the synchronous SDK wrapped in ``asyncio.to_thread`` to
-avoid blocking the event loop, and polls the run so connected sub-agent activity can be
-streamed to the UI as it happens.
+installed. Network calls are synchronous, so they are wrapped in ``asyncio.to_thread``
+to avoid blocking the event loop.
+
+A single Responses call returns the full ``output`` list: the assistant message (with
+text + citation annotations) plus any tool / connected-agent call items. We parse those
+items to surface each sub-agent's activity and the sources, then stream the final answer
+to the UI in chunks for a live feel.
 """
 from __future__ import annotations
 
 import asyncio
-import time
+import os
 import uuid
 from typing import Any, AsyncGenerator, Optional
 
 from .config import Settings
 from .models import AgentInfo, AgentStep, ChatMessage, Source
 
-_TERMINAL_STATES = {"completed", "failed", "cancelled", "expired"}
-_FAILED_STATES = {"failed", "cancelled", "expired"}
-_MAX_POLL_SECONDS = 180  # safety cap so an SSE request can't hang forever
+# Output item types that are NOT sub-agent / tool activity worth surfacing.
+# `mcp_list_tools` is just tool discovery; `message`/`reasoning` are the answer itself.
+_NON_STEP_ITEM_TYPES = {"message", "reasoning", "mcp_list_tools"}
+
+
+def _strip_text_prefix(s: str) -> str:
+    """Strip a stray leading ``text`` artifact this Foundry preview prepends to answers.
+
+    Observed consistently as the literal ``text`` immediately followed by the real
+    answer, e.g. ``textAn RFI...`` or ``text\\n\\nBased on...``. Stripped only when what
+    follows is an uppercase letter, newline, or markdown marker, to avoid mangling
+    answers that legitimately begin with the lowercase word "text".
+    """
+    if s.startswith("text") and len(s) > 4:
+        nxt = s[4]
+        if nxt.isupper() or nxt in "\n\r\t#*->•":
+            return s[4:].lstrip()
+    return s
+
+
+def _decode_mcp_source(uri: str) -> Optional[tuple[str, str]]:
+    """Turn an internal ``mcp://searchindex/<hash>_<base64-url>_pages_<n>`` citation into
+    a friendly ``(title, url)``. Returns None if it isn't a decodable mcp source."""
+    if not uri or "/searchindex/" not in uri:
+        return None
+    try:
+        import base64
+        import re
+        from urllib.parse import unquote
+
+        rest = uri.split("/searchindex/", 1)[1]
+        _, _, after = rest.partition("_")  # drop the leading hash id
+        page = None
+        mp = re.search(r"_pages?_(\d+)$", after)
+        if mp:
+            page = mp.group(1)
+            after = after[: mp.start()]
+        b64 = after + "=" * (-len(after) % 4)
+        try:
+            decoded = base64.b64decode(b64).decode("utf-8", "ignore")
+        except Exception:
+            decoded = base64.urlsafe_b64decode(b64).decode("utf-8", "ignore")
+        decoded = decoded.strip().strip("\r\n\t ")
+        if not decoded.lower().startswith("http"):
+            return None
+        file_name = unquote(decoded.rsplit("/", 1)[-1]).replace("+", " ")
+        title = f"{file_name} (p. {page})" if page else file_name
+        return title, decoded
+    except Exception:
+        return None
 
 
 def _attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -32,7 +88,6 @@ def _attr(obj: Any, name: str, default: Any = None) -> Any:
     val = getattr(obj, name, None)
     if val is not None:
         return val
-    # Azure SDK models are mutable-mapping-like; fall back to item access.
     getter = getattr(obj, "get", None)
     if callable(getter):
         try:
@@ -47,197 +102,143 @@ def _attr(obj: Any, name: str, default: Any = None) -> Any:
 class LiveProvider:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._client = None
-        self._agent_names: dict[str, str] = {}
-        self._all_agents_cache: Optional[list] = None
-        self._resolved_main_id: Optional[str] = None
+        self._project = None
+        self._openai_clients: dict[str, Any] = {}
+        self._agent_meta_cache: Optional[list] = None
+        # thread_id -> last response id, for multi-turn continuity via the Responses API.
+        self._threads: dict[str, Optional[str]] = {}
 
     # ---- client lifecycle -------------------------------------------------
-    def _get_client(self):
-        if self._client is None:
+    def _project_client(self):
+        if self._project is None:
             from azure.ai.projects import AIProjectClient
             from azure.identity import DefaultAzureCredential
 
-            self._client = AIProjectClient(
+            # When the Foundry resource is in a different tenant than the default
+            # `az login` (e.g. you're a guest user), force the credential to that
+            # tenant. DefaultAzureCredential reads AZURE_TENANT_ID from the env.
+            if self.settings.azure_tenant_id:
+                os.environ["AZURE_TENANT_ID"] = self.settings.azure_tenant_id
+
+            # allow_preview is required to bind the OpenAI client to a named agent.
+            self._project = AIProjectClient(
                 endpoint=self.settings.project_endpoint,
                 credential=DefaultAzureCredential(),
+                allow_preview=True,
             )
-        return self._client
+        return self._project
 
-    def _agents(self):
-        """Return the agents operations group across SDK shapes."""
-        client = self._get_client()
-        # azure-ai-projects exposes the agents ops as `.agents`
-        return getattr(client, "agents", client)
+    def _openai_for(self, agent_name: str):
+        """An OpenAI client bound to a specific existing Foundry agent (cached)."""
+        if agent_name not in self._openai_clients:
+            self._openai_clients[agent_name] = self._project_client().get_openai_client(
+                agent_name=agent_name
+            )
+        return self._openai_clients[agent_name]
 
-    # ---- agent lookup by name --------------------------------------------
-    def _all_agents(self, agents) -> list:
-        """List every agent in the project (cached) for name-based resolution."""
-        if self._all_agents_cache is None:
-            try:
-                if hasattr(agents, "list_agents"):
-                    self._all_agents_cache = list(agents.list_agents())
-                else:
-                    self._all_agents_cache = list(agents.list())
-            except Exception:
-                self._all_agents_cache = []
-        return self._all_agents_cache
+    # ---- name/id resolution ----------------------------------------------
+    def _agent_name_only(self, value: str) -> str:
+        """Strip a trailing ``:version`` so ``rfpagent:6`` -> ``rfpagent``."""
+        return value.split(":", 1)[0] if value else value
 
-    def _find_by_name(self, agents, name: str):
-        target = name.strip().lower()
-        for a in self._all_agents(agents):
-            if (_attr(a, "name", "") or "").strip().lower() == target:
-                return a
-        return None
-
-    def _resolve_agent(self, agents, by_id: str, by_name: str):
-        """Resolve an agent to (id, name, description) from an id or a name."""
-        if by_id:
-            try:
-                agent = agents.get_agent(by_id)
-                return by_id, _attr(agent, "name", by_id) or by_id, _attr(agent, "description", "") or ""
-            except Exception:
-                return by_id, by_id, ""
-        if by_name:
-            agent = self._find_by_name(agents, by_name)
-            if agent is not None:
-                return (
-                    _attr(agent, "id"),
-                    _attr(agent, "name", by_name) or by_name,
-                    _attr(agent, "description", "") or "",
-                )
-        return None
-
-    def _main_agent_id(self, agents) -> str:
-        """The orchestrator agent id, resolved from MAIN_AGENT_ID or MAIN_AGENT_NAME."""
-        if self._resolved_main_id:
-            return self._resolved_main_id
-        resolved = self._resolve_agent(
-            agents, self.settings.main_agent_id, self.settings.main_agent_name
+    def _main_agent_name(self) -> str:
+        if self.settings.main_agent_name:
+            return self._agent_name_only(self.settings.main_agent_name)
+        if self.settings.main_agent_id:
+            return self._agent_name_only(self.settings.main_agent_id)
+        raise RuntimeError(
+            "No main agent configured. Set MAIN_AGENT_NAME (recommended) or MAIN_AGENT_ID "
+            "in backend/.env to the name of your RFP agent in the Foundry project."
         )
-        if not resolved or not resolved[0]:
-            raise RuntimeError(
-                "Could not resolve the main agent. Set MAIN_AGENT_ID, or set "
-                f"MAIN_AGENT_NAME to an agent that exists in this project "
-                f"(looked for '{self.settings.main_agent_name}')."
-            )
-        self._resolved_main_id = resolved[0]
-        return self._resolved_main_id
+
+    def _all_agent_meta(self) -> list:
+        """List agents in the project (cached, best-effort) for metadata lookups."""
+        if self._agent_meta_cache is None:
+            try:
+                agents_ops = self._project_client().agents
+                self._agent_meta_cache = list(agents_ops.list())
+            except Exception:
+                self._agent_meta_cache = []
+        return self._agent_meta_cache
+
+    def _describe(self, name: str) -> tuple[str, str]:
+        """Return (id, description) for an agent name, best-effort."""
+        target = self._agent_name_only(name).strip().lower()
+        for a in self._all_agent_meta():
+            a_name = (_attr(a, "name", "") or "").strip().lower()
+            if a_name == target:
+                return (
+                    str(_attr(a, "id", name) or name),
+                    str(_attr(a, "description", "") or ""),
+                )
+        return name, ""
 
     # ---- agent metadata ---------------------------------------------------
     def list_agents(self) -> list[AgentInfo]:
-        agents = self._agents()
         infos: list[AgentInfo] = []
 
-        main = self._resolve_agent(
-            agents, self.settings.main_agent_id, self.settings.main_agent_name
+        main_name = self._main_agent_name()
+        main_id, main_desc = self._describe(main_name)
+        infos.append(
+            AgentInfo(id=main_id, name=main_name, description=main_desc, role="main")
         )
-        if main:
-            self._agent_names[main[0]] = main[1]
-            infos.append(AgentInfo(id=main[0], name=main[1], description=main[2], role="main"))
 
-        connected_ids = self.settings.connected_agent_id_list
-        connected_names = self.settings.connected_agent_name_list
-        pairs = [(cid, "") for cid in connected_ids] + [("", cn) for cn in connected_names]
-        for cid, cname in pairs:
-            resolved = self._resolve_agent(agents, cid, cname)
-            if not resolved or not resolved[0]:
-                continue
-            self._agent_names[resolved[0]] = resolved[1]
+        # Connected sub-agents are surfaced at runtime as tool calls, but any explicitly
+        # configured ones are listed up-front so the directory isn't empty before a run.
+        for cname in self.settings.connected_agent_name_list:
+            cid, cdesc = self._describe(cname)
             infos.append(
                 AgentInfo(
-                    id=resolved[0], name=resolved[1], description=resolved[2], role="connected"
+                    id=cid,
+                    name=self._agent_name_only(cname),
+                    description=cdesc,
+                    role="connected",
+                )
+            )
+        for cid in self.settings.connected_agent_id_list:
+            infos.append(
+                AgentInfo(
+                    id=cid, name=self._agent_name_only(cid), description="", role="connected"
                 )
             )
         return infos
 
-    # ---- threads ----------------------------------------------------------
+    # ---- threads (client-side conversation handles) -----------------------
     def create_thread(self) -> str:
-        agents = self._agents()
-        thread = agents.threads.create() if hasattr(agents, "threads") else agents.create_thread()
-        return _attr(thread, "id")
+        thread_id = f"thread_{uuid.uuid4().hex}"
+        self._threads[thread_id] = None
+        return thread_id
 
     def get_messages(self, thread_id: str) -> list[ChatMessage]:
-        agents = self._agents()
-        try:
-            if hasattr(agents, "messages"):
-                raw = list(agents.messages.list(thread_id=thread_id))
-            else:
-                raw = list(agents.list_messages(thread_id=thread_id))
-        except Exception:
-            return []
-        messages: list[ChatMessage] = []
-        for m in reversed(list(raw)):  # SDK returns newest-first
-            role = _attr(m, "role", "assistant")
-            text, sources = self._extract_text_and_sources(m)
-            messages.append(
-                ChatMessage(role=role, content=text, sources=sources)  # type: ignore[arg-type]
-            )
-        return messages
+        # The Responses API keeps server-side state keyed by response id; the UI keeps
+        # its own visible history, so there's nothing extra to reload here.
+        return []
 
     # ---- chat / streaming -------------------------------------------------
     async def stream_chat(
         self, thread_id: str, message: str
     ) -> AsyncGenerator[dict, None]:
-        agents = self._agents()
+        agent_name = self._main_agent_name()
+        previous_id = self._threads.get(thread_id)
 
-        await asyncio.to_thread(self._create_user_message, agents, thread_id, message)
-        run = await asyncio.to_thread(self._create_run, agents, thread_id)
-        run_id = _attr(run, "id")
-
-        # call_id -> (emitted_status, has_output) for dedupe; collected -> latest AgentStep
-        seen_steps: dict[str, tuple[str, bool]] = {}
-        collected: dict[str, AgentStep] = {}
-        deadline = time.monotonic() + _MAX_POLL_SECONDS
-        status = ""
-
-        # Poll the run, surfacing connected sub-agent steps as they appear.
-        while True:
-            run = await asyncio.to_thread(self._get_run, agents, thread_id, run_id)
-            status = (_attr(run, "status", "") or "").lower()
-
-            steps = await asyncio.to_thread(self._list_run_steps, agents, thread_id, run_id)
-            for step in steps:
-                for evt in self._steps_to_events(step, seen_steps, collected):
-                    yield evt
-
-            if status in _TERMINAL_STATES:
-                break
-            if status == "requires_action":
-                yield {
-                    "event": "error",
-                    "data": {
-                        "message": "The run requires client tool output, which this app "
-                        "does not submit. Configure tools as connected agents or "
-                        "server-side tools in Foundry."
-                    },
-                }
-                return
-            if time.monotonic() > deadline:
-                yield {
-                    "event": "error",
-                    "data": {"message": "Timed out waiting for the agent run to finish."},
-                }
-                return
-            await asyncio.sleep(1.0)
-
-        # Final refresh: late-arriving connected-agent outputs after the terminal state.
-        steps = await asyncio.to_thread(self._list_run_steps, agents, thread_id, run_id)
-        for step in steps:
-            for evt in self._steps_to_events(step, seen_steps, collected):
-                yield evt
-
-        if status != "completed":
-            yield {
-                "event": "error",
-                "data": {"message": f"Run ended with status: {status}"},
-            }
+        try:
+            response = await asyncio.to_thread(
+                self._create_response, agent_name, message, previous_id
+            )
+        except Exception as exc:  # surface a clear, actionable message to the UI
+            yield {"event": "error", "data": {"message": self._friendly_error(exc)}}
             return
 
-        # Fetch the final assistant message, then stream its text and sources.
-        final = await asyncio.to_thread(self._latest_assistant_message, agents, thread_id)
-        text, sources = self._extract_text_and_sources(final)
+        # Remember the response id so the next turn continues the conversation.
+        self._threads[thread_id] = _attr(response, "id")
 
+        text, sources, steps = self._parse_response(response, agent_name)
+
+        # Surface each sub-agent / tool call first, in order.
+        for step in steps:
+            yield {"event": "agent_step", "data": step.model_dump()}
+
+        # Stream the final answer in chunks for a live typing feel.
         for chunk in _chunks(text, 24):
             yield {"event": "token", "data": {"text": chunk}}
             await asyncio.sleep(0.01)
@@ -248,183 +249,179 @@ class LiveProvider:
         assistant = ChatMessage(
             role="assistant",
             content=text,
-            agent_steps=list(collected.values()),
+            agent_steps=steps,
             sources=sources,
         )
         yield {"event": "done", "data": {"message": assistant.model_dump()}}
 
-    # ---- SDK helpers (sync, run via to_thread) ----------------------------
-    def _create_user_message(self, agents, thread_id: str, message: str) -> None:
-        if hasattr(agents, "messages"):
-            agents.messages.create(thread_id=thread_id, role="user", content=message)
-        else:
-            agents.create_message(thread_id=thread_id, role="user", content=message)
-
-    def _create_run(self, agents, thread_id: str):
-        agent_id = self._main_agent_id(agents)
-        if hasattr(agents, "runs"):
-            return agents.runs.create(thread_id=thread_id, agent_id=agent_id)
-        return agents.create_run(thread_id=thread_id, agent_id=agent_id)
-
-    def _get_run(self, agents, thread_id: str, run_id: str):
-        if hasattr(agents, "runs"):
-            return agents.runs.get(thread_id=thread_id, run_id=run_id)
-        return agents.get_run(thread_id=thread_id, run_id=run_id)
-
-    def _list_run_steps(self, agents, thread_id: str, run_id: str) -> list[Any]:
-        # Request ascending order so the UI shows agents in the order they ran.
-        try:
-            if hasattr(agents, "run_steps"):
-                try:
-                    return list(
-                        agents.run_steps.list(
-                            thread_id=thread_id, run_id=run_id, order="asc"
-                        )
-                    )
-                except TypeError:
-                    return list(agents.run_steps.list(thread_id=thread_id, run_id=run_id))
-            return list(agents.list_run_steps(thread_id=thread_id, run_id=run_id))
-        except Exception:
-            return []
-
-    def _latest_assistant_message(self, agents, thread_id: str):
-        if hasattr(agents, "messages"):
-            raw = list(agents.messages.list(thread_id=thread_id))
-        else:
-            raw = list(agents.list_messages(thread_id=thread_id))
-        for m in raw:  # newest-first
-            if _attr(m, "role") == "assistant":
-                return m
-        return raw[0] if raw else None
+    # ---- SDK call (sync, run via to_thread) -------------------------------
+    def _create_response(self, agent_name: str, message: str, previous_id: Optional[str]):
+        client = self._openai_for(agent_name)
+        kwargs: dict[str, Any] = {"input": message}
+        if previous_id:
+            kwargs["previous_response_id"] = previous_id
+        return client.responses.create(**kwargs)
 
     # ---- parsing ----------------------------------------------------------
-    def _steps_to_events(
-        self,
-        step,
-        seen: dict[str, tuple[str, bool]],
-        collected: dict[str, "AgentStep"],
-    ) -> list[dict]:
-        """Convert a run step into agent_step events for connected sub-agents.
+    def _parse_response(
+        self, response, main_agent_name: str
+    ) -> tuple[str, list[Source], list[AgentStep]]:
+        """Extract (final_text, sources, sub_agent_steps) from a Responses result."""
+        steps: list[AgentStep] = []
+        sources: list[Source] = []
+        text_parts: list[str] = []
 
-        Dedupes on (status, has_output) so a step first seen as completed-without-output
-        is re-emitted once its output lands (Azure polling is eventually consistent).
-        """
-        events: list[dict] = []
-        details = _attr(step, "step_details")
-        if _attr(details, "type") != "tool_calls":
-            return events
+        for item in _attr(response, "output", []) or []:
+            itype = (_attr(item, "type", "") or "").lower()
 
-        tool_calls = _attr(details, "tool_calls", []) or []
-        status = (_attr(step, "status", "") or "").lower()
-        for call in tool_calls:
-            call_id = _attr(call, "id", uuid.uuid4().hex)
-            agent_name, agent_id, input_text, output_text = self._parse_connected_call(call)
-            if agent_name is None:
+            if itype == "message":
+                t, s = self._parse_message_item(item)
+                if t:
+                    text_parts.append(t)
+                sources.extend(s)
                 continue
 
-            if status == "completed":
-                emitted_status = "completed"
-            elif status in _FAILED_STATES:
-                emitted_status = "failed"
-            else:
-                emitted_status = "running"
-
-            has_output = bool(output_text)
-            key = (emitted_status, has_output)
-            if seen.get(call_id) == key:
+            if itype in _NON_STEP_ITEM_TYPES:
                 continue
-            seen[call_id] = key
 
-            agent_step = AgentStep(
-                id=call_id,
-                agent_name=agent_name,
-                agent_id=agent_id,
-                status=emitted_status,  # type: ignore[arg-type]
-                input=input_text,
-                output=output_text if emitted_status != "running" else None,
-            )
-            collected[call_id] = agent_step
-            events.append({"event": "agent_step", "data": agent_step.model_dump()})
-        return events
+            step = self._tool_item_to_step(item, itype)
+            if step:
+                steps.append(step)
 
-    def _parse_connected_call(self, call) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-        """Best-effort extraction of a connected-agent (or tool) call's I/O."""
-        call_type = _attr(call, "type", "")
+        # Prefer the SDK's convenience join if we couldn't assemble message text.
+        text = "\n".join(p for p in text_parts if p).strip()
+        if not text:
+            text = (_attr(response, "output_text", "") or "").strip()
+        text = _strip_text_prefix(text)
 
-        # Connected agent tool call.
-        connected = _attr(call, "connected_agent")
-        if connected is not None:
-            name = _attr(connected, "name") or _attr(connected, "agent_name") or "Connected agent"
-            return (
-                name,
-                _attr(connected, "agent_id") or _attr(connected, "id"),
-                _attr(connected, "input") or _attr(connected, "arguments"),
-                _attr(connected, "output") or _attr(connected, "response"),
-            )
+        return text, sources, steps
 
-        # Generic function/tool call — surface as a tool step.
-        if call_type == "function":
-            fn = _attr(call, "function")
-            name = _attr(fn, "name", "function")
-            return (
-                f"Tool: {name}",
-                None,
-                _attr(fn, "arguments"),
-                _attr(fn, "output"),
-            )
-
-        if call_type in {"file_search", "azure_ai_search", "bing_grounding"}:
-            return (f"Tool: {call_type}", None, None, None)
-
-        return (None, None, None, None)
-
-    def _extract_text_and_sources(self, message) -> tuple[str, list[Source]]:
-        if message is None:
-            return "", []
+    def _parse_message_item(self, item) -> tuple[str, list[Source]]:
         text_parts: list[str] = []
         sources: list[Source] = []
-
-        content = _attr(message, "content", []) or []
-        for block in content:
-            text_obj = _attr(block, "text")
-            if text_obj is None and isinstance(block, str):
-                text_parts.append(block)
-                continue
-            value = _attr(text_obj, "value")
-            if value:
-                text_parts.append(value)
-            for ann in _attr(text_obj, "annotations", []) or []:
-                src = self._annotation_to_source(ann)
-                if src:
-                    sources.append(src)
-
-        # Fallback for SDKs exposing a flat text property.
-        if not text_parts:
-            flat = _attr(message, "text")
-            if isinstance(flat, str):
-                text_parts.append(flat)
-
+        for block in _attr(item, "content", []) or []:
+            btype = (_attr(block, "type", "") or "").lower()
+            if btype in ("output_text", "text", ""):
+                value = _attr(block, "text")
+                if isinstance(value, str) and value:
+                    text_parts.append(value)
+                for ann in _attr(block, "annotations", []) or []:
+                    src = self._annotation_to_source(ann)
+                    if src:
+                        sources.append(src)
+            elif btype == "refusal":
+                refusal = _attr(block, "refusal")
+                if isinstance(refusal, str):
+                    text_parts.append(refusal)
         return "\n".join(text_parts).strip(), sources
 
+    def _tool_item_to_step(self, item, itype: str) -> Optional[AgentStep]:
+        """Map a tool / connected-agent output item to an AgentStep."""
+        name = (
+            _attr(item, "name")
+            or _attr(item, "server_label")
+            or _attr(item, "agent_name")
+            or itype.replace("_call", "").replace("_", " ").title()
+            or "Tool"
+        )
+
+        input_text = self._stringify(
+            _attr(item, "arguments")
+            or _attr(item, "input")
+            or _attr(item, "queries")
+            or _attr(item, "query")
+        )
+        output_text = self._stringify(
+            _attr(item, "output")
+            or _attr(item, "response")
+            or _attr(item, "results")
+            or _attr(item, "result")
+        )
+
+        raw_status = (_attr(item, "status", "") or "").lower()
+        if raw_status in ("failed", "incomplete", "error"):
+            status = "failed"
+        else:
+            status = "completed"
+
+        return AgentStep(
+            id=str(_attr(item, "id", uuid.uuid4().hex)),
+            agent_name=str(name),
+            agent_id=_attr(item, "id"),
+            status=status,  # type: ignore[arg-type]
+            input=input_text or None,
+            output=output_text or None,
+        )
+
     def _annotation_to_source(self, ann) -> Optional[Source]:
-        file_cit = _attr(ann, "file_citation")
-        url_cit = _attr(ann, "url_citation")
-        quote = _attr(ann, "text") or ""
-        if file_cit is not None:
+        atype = (_attr(ann, "type", "") or "").lower()
+        snippet = _attr(ann, "text") or _attr(ann, "quote") or ""
+
+        if atype == "url_citation":
+            url = _attr(ann, "url")
+            decoded = _decode_mcp_source(url) if isinstance(url, str) else None
+            if decoded:
+                title, real_url = decoded
+                return Source(
+                    id=f"src_{uuid.uuid4().hex[:8]}",
+                    title=title,
+                    snippet=snippet,
+                    url=real_url,
+                    file_name=title,
+                )
             return Source(
                 id=f"src_{uuid.uuid4().hex[:8]}",
-                title=_attr(file_cit, "file_name") or _attr(file_cit, "file_id") or "Document",
-                snippet=_attr(file_cit, "quote") or quote,
-                file_name=_attr(file_cit, "file_name"),
+                title=_attr(ann, "title") or url or "Source",
+                snippet=snippet,
+                url=url,
             )
-        if url_cit is not None:
+        if atype in ("file_citation", "file_path", "container_file_citation"):
+            file_name = (
+                _attr(ann, "filename")
+                or _attr(ann, "file_name")
+                or _attr(ann, "file_id")
+                or "Document"
+            )
             return Source(
                 id=f"src_{uuid.uuid4().hex[:8]}",
-                title=_attr(url_cit, "title") or _attr(url_cit, "url") or "Source",
-                snippet=quote,
-                url=_attr(url_cit, "url"),
+                title=str(file_name),
+                snippet=snippet,
+                file_name=str(file_name),
             )
         return None
+
+    # ---- helpers ----------------------------------------------------------
+    @staticmethod
+    def _stringify(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            import json
+
+            return json.dumps(value, default=str, ensure_ascii=False)
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _friendly_error(exc: Exception) -> str:
+        msg = str(exc)
+        low = msg.lower()
+        if "403" in low or "permission" in low or "forbidden" in low:
+            return (
+                "Permission denied invoking the Foundry agent (HTTP 403). Your signed-in "
+                "identity can list agents but is not allowed to run them. Grant it a role "
+                "that includes 'Microsoft.MachineLearningServices/workspaces/agents/action' "
+                "(e.g. 'Azure AI User' / 'Azure AI Project Manager') on the Foundry project, "
+                "then retry. Original error: " + msg
+            )
+        if "404" in low or "not found" in low:
+            return (
+                "The configured agent was not found. Check MAIN_AGENT_NAME in backend/.env "
+                "matches an agent in this Foundry project. Original error: " + msg
+            )
+        return f"Foundry agent call failed: {msg}"
 
 
 def _chunks(text: str, size: int):

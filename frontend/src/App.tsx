@@ -81,7 +81,15 @@ export default function App() {
         setError(m);
         setStreaming(false);
       },
-    });
+    })
+      .catch((e: unknown) => {
+        setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        // Safety net: if the stream ended without a done/error event, clear state.
+        setStreaming(false);
+        setLiveText("");
+      });
   };
 
   // Refs so onDone can read the latest live values without stale closures.
